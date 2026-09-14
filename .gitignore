@@ -20,3 +20,14 @@ Thumbs.db
 
 .vscode/
 .idea/
+
+# Playwright 产物
+test-results/
+playwright-report/
+playwright/.cache/
+
+# 无 root 环境下由 scripts/setup-browser.sh 解包的浏览器动态库
+.pw-libs/
+
+# 测试用临时数据文件
+*.e2e-db.json
