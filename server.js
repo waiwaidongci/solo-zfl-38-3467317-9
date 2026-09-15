@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,17 +101,33 @@ async function loadDb() {
   return db;
 }
 async function saveDb(db) {
+  // 测试故障注入：命中一次保存失败（仅在 ENABLE_FAULTS=1 时可被远端设置）
+  if (faultFailSaves > 0) {
+    faultFailSaves -= 1;
+    await rm(dbPath + ".tmp", { force: true }).catch(() => {});
+    throw Object.assign(new Error("injected_disk_write_failure"), { code: "EFAULT" });
+  }
   const tmp = dbPath + ".tmp";
-  await writeFile(tmp, JSON.stringify(db, null, 2));
-  await rename(tmp, dbPath);
+  try {
+    await writeFile(tmp, JSON.stringify(db, null, 2));
+    await rename(tmp, dbPath);
+  } catch (error) {
+    // 落盘失败不能在磁盘上留下半成品临时文件
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
-/* ---------------- 并发写入：进程内缓存 + 串行提交队列 ----------------
+/* ---------------- 并发写入 + 事务性提交 ----------------
    每个请求以前都各自 loadDb()/saveDb()，并发时会互相覆盖（后写赢，丢记录），
    还会争用同一个 .tmp 文件导致服务端错误。现在：
-   - db 只加载一次，所有请求读写同一份内存对象；
-   - 一切变更经 writeChain 串行执行，变更函数先做校验（抛 HttpError 即不写盘），
-     成功后才 saveDb，落盘完成才返回成功响应——响应与持久化结果一致。 */
+   - db 只加载一次，所有请求读取同一份“已提交”内存；
+   - 一切变更经 writeChain 串行执行；
+   - 变更在已提交数据的深克隆上进行，saveDb 成功后才把克隆发布为新的已提交内存。
+     因此保存失败时：内存维持提交前状态（后续读取看不到未落盘数据，重启也一致），
+     成功响应一定对应已经落盘的数据；校验抛 HttpError 时同样不写盘。 */
+// 测试用故障注入：仅当 ENABLE_FAULTS=1 时可用，POST /api/test/faults {failSaves:n}
+let faultFailSaves = 0;
 class HttpError extends Error {
   constructor(statusCode, code, detail) {
     super(detail || code);
@@ -121,16 +137,22 @@ class HttpError extends Error {
   }
 }
 let dbPromise = null;
-function getDb() {
+const dbHolder = { current: null };
+async function getDb() {
   dbPromise ||= loadDb();
-  return dbPromise;
+  // 只在首次用磁盘数据填充；之后以 withWrite 发布的已提交克隆为准
+  if (!dbHolder.current) dbHolder.current = await dbPromise;
+  return dbHolder.current;
 }
 let writeChain = Promise.resolve();
 function withWrite(mutator) {
   const run = writeChain.then(async () => {
-    const db = await getDb();
-    const result = await mutator(db);
-    await saveDb(db); // 落盘成功后才让请求返回成功
+    const committed = await getDb();
+    // 在已提交数据的隔离克隆上做变更，失败可整体丢弃
+    const draft = structuredClone(committed);
+    const result = await mutator(draft);
+    await saveDb(draft); // 落盘成功才提交
+    dbHolder.current = draft;
     return result;
   });
   // 一次失败不能中断后续排队的写操作
@@ -735,6 +757,18 @@ function err400(res, code, detail) { return send(res, 400, { error: code, detail
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    /* 仅测试环境（ENABLE_FAULTS=1）：模拟磁盘写入失败 */
+    if (url.pathname === "/api/test/faults") {
+      if (process.env.ENABLE_FAULTS !== "1") return send(res, 404, { error: "not_found" });
+      if (req.method === "POST") {
+        const input = await body(req);
+        faultFailSaves = Math.max(0, Number(input.failSaves) || 0);
+        return send(res, 200, { failSaves: faultFailSaves });
+      }
+      if (req.method === "GET") return send(res, 200, { failSaves: faultFailSaves });
+    }
+
     const db = await getDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
     if (req.method === "GET" && url.pathname === "/rig") return html(res, rigPage());
