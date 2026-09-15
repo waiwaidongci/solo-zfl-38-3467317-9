@@ -17,11 +17,12 @@ const ISSUE_LABELS = {
   dangling: "悬空端点",
   repeated: "重复经过",
   cross_mast: "跨桅错接",
+  unlinked: "连接未登记",
   joint_mismatch: "接头不匹配",
   reversed: "起终点倒置",
   wrong_zone: "未回到目标桅区"
 };
-const ISSUE_ORDER = ["dangling", "repeated", "cross_mast", "joint_mismatch", "reversed", "wrong_zone"];
+const ISSUE_ORDER = ["dangling", "repeated", "cross_mast", "unlinked", "joint_mismatch", "reversed", "wrong_zone"];
 
 function sampleRig() {
   return {
@@ -36,7 +37,7 @@ function sampleRig() {
       { id: "T2", type: "系点", zone: "主桅" },
       { id: "J1", type: "接头", zone: "主桅", jointType: "环扣" }
     ],
-    // 允许连接关系：未列出的节点默认允许与任意节点相连（滑轮可转向）
+    // 允许连接关系白名单：索路的每一段都必须登记在这里
     links: [
       { from: "M-M", to: "B1" },
       { from: "B1", to: "J1" },
@@ -104,6 +105,38 @@ async function saveDb(db) {
   await writeFile(tmp, JSON.stringify(db, null, 2));
   await rename(tmp, dbPath);
 }
+
+/* ---------------- 并发写入：进程内缓存 + 串行提交队列 ----------------
+   每个请求以前都各自 loadDb()/saveDb()，并发时会互相覆盖（后写赢，丢记录），
+   还会争用同一个 .tmp 文件导致服务端错误。现在：
+   - db 只加载一次，所有请求读写同一份内存对象；
+   - 一切变更经 writeChain 串行执行，变更函数先做校验（抛 HttpError 即不写盘），
+     成功后才 saveDb，落盘完成才返回成功响应——响应与持久化结果一致。 */
+class HttpError extends Error {
+  constructor(statusCode, code, detail) {
+    super(detail || code);
+    this.statusCode = statusCode;
+    this.code = code;
+    this.detail = detail || code;
+  }
+}
+let dbPromise = null;
+function getDb() {
+  dbPromise ||= loadDb();
+  return dbPromise;
+}
+let writeChain = Promise.resolve();
+function withWrite(mutator) {
+  const run = writeChain.then(async () => {
+    const db = await getDb();
+    const result = await mutator(db);
+    await saveDb(db); // 落盘成功后才让请求返回成功
+    return result;
+  });
+  // 一次失败不能中断后续排队的写操作
+  writeChain = run.then(() => {}, () => {});
+  return run;
+}
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -153,8 +186,8 @@ function indexLinks(links) {
   return out;
 }
 function linkAllowed(linkMap, fromId, toId) {
-  if (!linkMap.has(fromId)) return true; // 未登记出向连接：滑轮自由转向
-  return linkMap.get(fromId).has(toId);
+  // 严格白名单：from 未登记出向连接或 to 不在其出向集合中，都判为缺失
+  return linkMap.get(fromId)?.has(toId) === true;
 }
 
 // 校验一条索路，返回问题数组：{type, position, detail}
@@ -189,18 +222,24 @@ function validateRoute(route, byId, linkMap) {
     }
   }
 
-  // 4. 接头不匹配：
-  //    a) 相邻两个接头型号必须一致（每个接头只与前一个接头比较，避免重复报告）
-  //    b) 接头侧的连接必须在登记的允许连接关系中（接头不能自由转向；其余节点默认可自由相连）
+  // 4. 连接与接头：
+  //    a) 每一段相邻连接都必须在登记的允许连接关系中（缺出向登记或缺某段同样阻断）；
+  //       任一端是接头时归为“接头不匹配”，否则归为“连接未登记”
+  //    b) 相邻两个接头型号必须一致（每个接头只与前一个接头比较，避免重复报告）
   for (let i = 1; i < seq.length; i++) {
     const a = node(seq[i - 1]), b = node(seq[i]);
     if (!a || !b) continue;
     if (b.type === "接头" && a.type === "接头" && a.jointType && b.jointType && a.jointType !== b.jointType) {
       push("joint_mismatch", at(i), `相邻接头「${a.id}(${a.jointType})」与「${b.id}(${b.jointType})」型号不匹配`);
     }
-    const jointEnd = a.type === "接头" ? a : (b.type === "接头" ? b : null);
-    if (jointEnd && !linkAllowed(linkMap, a.id, b.id)) {
-      push("joint_mismatch", at(i), `接头「${jointEnd.id}」侧的连接「${a.id} → ${b.id}」不在允许连接关系中`);
+    if (!linkAllowed(linkMap, a.id, b.id)) {
+      const isJoint = a.type === "接头" || b.type === "接头";
+      if (isJoint) {
+        const j = a.type === "接头" ? a : b;
+        push("joint_mismatch", at(i), `接头「${j.id}」侧的连接「${a.id} → ${b.id}」未登记在允许连接关系中`);
+      } else {
+        push("unlinked", at(i), `连接段「${a.id} → ${b.id}」未登记允许连接关系`);
+      }
     }
   }
 
@@ -215,9 +254,13 @@ function validateRoute(route, byId, linkMap) {
     }
   }
 
-  // 6. 未回到目标桅区：终点桅区必须等于索路目标桅区
-  if (e && route.targetZone && e.zone !== route.targetZone) {
-    push("wrong_zone", "终点", `终点「${e.id}」位于${e.zone}桅区，未回到目标桅区${route.targetZone}`);
+  // 6. 未回到目标桅区：目标桅区必填，且终点必须回到该区
+  if (e) {
+    if (!route.targetZone) {
+      push("wrong_zone", "目标桅区", "索路未填写目标桅区");
+    } else if (e.zone !== route.targetZone) {
+      push("wrong_zone", "终点", `终点「${e.id}」位于${e.zone}桅区，未回到目标桅区${route.targetZone}`);
+    }
   }
 
   // 去重（同一位置同一描述），按出现顺序
@@ -395,7 +438,7 @@ function rigPage() {
           <span id="readyBadge"></span>
         </div>
         <div id="graph"></div>
-        <div class="meta" style="margin-top:8px">实线为允许连接关系；彩色有向箭头为索路，<b style="color:var(--warn)">红色</b>表示该索路有阻断问题。</div>
+        <div class="meta" style="margin-top:8px">灰色虚线为已登记的允许连接关系；索路的<b>每一段</b>都必须登记。彩色有向箭头为索路，<b style="color:var(--warn)">红色</b>表示该索路有阻断问题。</div>
       </div>
 
       <div class="panel">
@@ -425,7 +468,7 @@ function rigPage() {
           <div class="err-text" id="nodeError"></div>
         </form>
         <form id="linkForm" style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px">
-          <h3>允许连接关系 <span class="meta">（登记接头两侧的合法连接）</span></h3>
+          <h3>允许连接关系 <span class="meta">（必填：索路的每一段都要登记）</span></h3>
           <div class="row">
             <div><label>从</label><select name="from" id="linkFrom"></select></div>
             <div><label>到</label><select name="to" id="linkTo"></select></div>
@@ -451,7 +494,7 @@ function rigPage() {
           <label>经过节点（按顺序，逗号或空格分隔）</label>
           <input name="via" placeholder="如 B1, J1, B2">
           <div class="row">
-            <div><label>目标桅区</label><input name="targetZone" placeholder="主桅"></div>
+            <div><label>目标桅区（必填）</label><input name="targetZone" required placeholder="主桅，终点必须回到该区"></div>
             <div style="display:flex;align-items:end"><button type="submit" style="width:100%">提交索路</button></div>
           </div>
           <div class="err-text" id="routeError"></div>
@@ -464,8 +507,8 @@ function rigPage() {
   <script>
     const NODE_TYPES = ["桅杆","滑轮","系点","接头"];
     const JOINT_TYPES = ["环扣","卸扣","索夹"];
-    const ISSUE_LABELS = { dangling:"悬空端点", repeated:"重复经过", cross_mast:"跨桅错接", joint_mismatch:"接头不匹配", reversed:"起终点倒置", wrong_zone:"未回到目标桅区" };
-    const ISSUE_ORDER = ["dangling","repeated","cross_mast","joint_mismatch","reversed","wrong_zone"];
+    const ISSUE_LABELS = { dangling:"悬空端点", repeated:"重复经过", cross_mast:"跨桅错接", unlinked:"连接未登记", joint_mismatch:"接头不匹配", reversed:"起终点倒置", wrong_zone:"未回到目标桅区" };
+    const ISSUE_ORDER = ["dangling","repeated","cross_mast","unlinked","joint_mismatch","reversed","wrong_zone"];
     const ZONE_COLORS = { "前桅":"#4b6cb7", "主桅":"#526f43", "后桅":"#8a6d3b" };
 
     const $ = s => document.querySelector(s);
@@ -692,51 +735,60 @@ function err400(res, code, detail) { return send(res, 400, { error: code, detail
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
+    const db = await getDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
     if (req.method === "GET" && url.pathname === "/rig") return html(res, rigPage());
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId("MR"), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
-      item.tasks = [];
-      item.rig = { targetZone: "", nodes: [], links: [], routes: [] };
-      db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+      const saved = await withWrite(d => {
+        const item = { id: newId("MR"), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
+        item.tasks = [];
+        item.rig = { targetZone: "", nodes: [], links: [], routes: [] };
+        d.items.unshift(item);
+        return item;
+      });
+      return send(res, 201, saved);
     }
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
+      const input = await body(req);
+      const saved = await withWrite(d => {
+        const item = d.items.find(x => x.id === patch[1] || x.code === patch[1]);
+        if (!item) throw new HttpError(404, "item_not_found");
+        Object.assign(item, input);
+        item.logs ||= [];
+        item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
+        return item;
+      });
+      return send(res, 200, saved);
     }
     const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
     if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+      const saved = await withWrite(d => {
+        const item = d.items.find(x => x.id === log[1] || x.code === log[1]);
+        if (!item) throw new HttpError(404, "item_not_found");
+        item.logs ||= [];
+        item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
+        return item;
+      });
+      return send(res, 201, saved);
     }
     const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
     if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
-      item.logs ||= [];
-      item.tasks ||= [];
-      item.tasks.push({ id: "T-" + Date.now(), position: input.position, tension: input.tension, status: "待检查", logs: [{ at: new Date().toISOString(), note: input.note || "新增帆索任务" }] });
-      item.status = "校准中";
-      item.logs.push({ at: new Date().toISOString(), step: "帆索", note: input.position + " · " + input.tension });
-      await saveDb(db);
-      return send(res, 201, item);
+      const saved = await withWrite(d => {
+        const item = d.items.find(x => x.id === action[1] || x.code === action[1]);
+        if (!item) throw new HttpError(404, "item_not_found");
+        item.logs ||= [];
+        item.tasks ||= [];
+        item.tasks.push({ id: "T-" + Date.now(), position: input.position, tension: input.tension, status: "待检查", logs: [{ at: new Date().toISOString(), note: input.note || "新增帆索任务" }] });
+        item.status = "校准中";
+        item.logs.push({ at: new Date().toISOString(), step: "帆索", note: input.position + " · " + input.tension });
+        return item;
+      });
+      return send(res, 201, saved);
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
 
@@ -746,100 +798,128 @@ const server = http.createServer(async (req, res) => {
     }
     const shipMatch = url.pathname.match(/^\/api\/ships\/([^/]+)(?:\/(nodes|routes|report|links)(?:\/(.+))?)?$/);
     if (shipMatch) {
-      const ship = findShip(db, decodeURIComponent(shipMatch[1]));
-      if (!ship) return send(res, 404, { error: "ship_not_found" });
-      const rig = ensureRig(ship);
+      const shipKey = decodeURIComponent(shipMatch[1]);
       const resource = shipMatch[2];
+      const locate = d => {
+        const ship = findShip(d, shipKey);
+        if (!ship) throw new HttpError(404, "ship_not_found");
+        return { ship, rig: ensureRig(ship) };
+      };
 
       if (req.method === "GET" && (!resource || resource === "report")) {
+        const { ship, rig } = locate(db);
         return send(res, 200, resource === "report" ? { code: ship.code, report: validateRig(rig) } : shipView(ship));
       }
 
       if (resource === "nodes" && req.method === "POST") {
         const input = await body(req);
-        const id = String(input.id || "").trim();
-        if (!id) return err400(res, "node_id_required", "节点编号不能为空");
-        if (rig.nodes.some(n => n.id === id)) return err400(res, "node_exists", `编号「${id}」已登记`);
-        if (!NODE_TYPES.includes(input.type)) return err400(res, "bad_node_type", `节点类型必须是：${NODE_TYPES.join(" / ")}`);
-        const zone = String(input.zone || "").trim();
-        if (!zone) return err400(res, "zone_required", "桅区不能为空");
-        const node = { id, type: input.type, zone };
-        if (input.type === "接头") {
-          if (!JOINT_TYPES.includes(input.jointType)) return err400(res, "bad_joint_type", `接头型号必须是：${JOINT_TYPES.join(" / ")}`);
-          node.jointType = input.jointType;
-        }
-        rig.nodes.push(node);
-        await saveDb(db);
-        return send(res, 201, shipView(ship));
+        const saved = await withWrite(d => {
+          const { rig, ship } = locate(d);
+          const id = String(input.id || "").trim();
+          if (!id) throw new HttpError(400, "node_id_required", "节点编号不能为空");
+          if (rig.nodes.some(n => n.id === id)) throw new HttpError(400, "node_exists", `编号「${id}」已登记`);
+          if (!NODE_TYPES.includes(input.type)) throw new HttpError(400, "bad_node_type", `节点类型必须是：${NODE_TYPES.join(" / ")}`);
+          const zone = String(input.zone || "").trim();
+          if (!zone) throw new HttpError(400, "zone_required", "桅区不能为空");
+          const node = { id, type: input.type, zone };
+          if (input.type === "接头") {
+            if (!JOINT_TYPES.includes(input.jointType)) throw new HttpError(400, "bad_joint_type", `接头型号必须是：${JOINT_TYPES.join(" / ")}`);
+            node.jointType = input.jointType;
+          }
+          rig.nodes.push(node);
+          return ship;
+        });
+        return send(res, 201, shipView(saved));
       }
 
       const nodeId = shipMatch[3] && resource === "nodes" ? decodeURIComponent(shipMatch[3]) : null;
       if (nodeId && req.method === "DELETE") {
-        const idx = rig.nodes.findIndex(n => n.id === nodeId);
-        if (idx < 0) return send(res, 404, { error: "node_not_found" });
-        rig.nodes.splice(idx, 1);
-        rig.links = rig.links.filter(l => l.from !== nodeId && l.to !== nodeId);
-        rig.routes.forEach(r => {
-          if (r.start === nodeId) r.start = "";
-          if (r.end === nodeId) r.end = "";
-          r.via = (r.via || []).filter(v => v !== nodeId);
+        const saved = await withWrite(d => {
+          const { rig, ship } = locate(d);
+          const idx = rig.nodes.findIndex(n => n.id === nodeId);
+          if (idx < 0) throw new HttpError(404, "node_not_found");
+          rig.nodes.splice(idx, 1);
+          rig.links = rig.links.filter(l => l.from !== nodeId && l.to !== nodeId);
+          rig.routes.forEach(r => {
+            if (r.start === nodeId) r.start = "";
+            if (r.end === nodeId) r.end = "";
+            r.via = (r.via || []).filter(v => v !== nodeId);
+          });
+          return ship;
         });
-        await saveDb(db);
-        return send(res, 200, shipView(ship));
+        return send(res, 200, shipView(saved));
       }
 
       if (resource === "links" && req.method === "POST") {
         const input = await body(req);
-        if (!rig.nodes.some(n => n.id === input.from) || !rig.nodes.some(n => n.id === input.to)) {
-          return err400(res, "link_node_unknown", "允许连接的两端节点必须先登记");
-        }
-        if (!rig.links.some(l => l.from === input.from && l.to === input.to)) rig.links.push({ from: input.from, to: input.to });
-        await saveDb(db);
-        return send(res, 201, shipView(ship));
+        const saved = await withWrite(d => {
+          const { rig, ship } = locate(d);
+          if (!rig.nodes.some(n => n.id === input.from) || !rig.nodes.some(n => n.id === input.to)) {
+            throw new HttpError(400, "link_node_unknown", "允许连接的两端节点必须先登记");
+          }
+          if (input.from === input.to) throw new HttpError(400, "link_self", "连接两端不能是同一节点");
+          if (!rig.links.some(l => l.from === input.from && l.to === input.to)) rig.links.push({ from: input.from, to: input.to });
+          return ship;
+        });
+        return send(res, 201, shipView(saved));
       }
 
       if (resource === "routes" && req.method === "POST") {
         const input = await body(req);
         const id = String(input.id || "").trim();
+        const name = String(input.name || "").trim();
+        const targetZone = String(input.targetZone || "").trim();
         if (!id) return err400(res, "route_id_required", "索号不能为空");
-        if (rig.routes.some(r => r.id === id)) return err400(res, "route_exists", `索号「${id}」已存在`);
-        if (!input.name || !String(input.name).trim()) return err400(res, "route_name_required", "索名/索位不能为空");
+        if (!name) return err400(res, "route_name_required", "索名/索位不能为空");
         if (!input.start || !input.end) return err400(res, "endpoint_required", "起点和终点都必须填写");
+        if (!targetZone) return err400(res, "target_zone_required", "目标桅区必填，且终点必须回到该区");
         const via = Array.isArray(input.via) ? input.via.map(String) : [];
-        // 索路即使存在校验问题也允许登记，问题由校验报告标出；仅结构性错误拒收（不写盘）
-        const route = { id, name: String(input.name).trim(), start: input.start, end: input.end, via, targetZone: String(input.targetZone || "").trim() };
-        rig.routes.push(route);
-        await saveDb(db);
-        return send(res, 201, shipView(ship));
+        const saved = await withWrite(d => {
+          const { rig, ship } = locate(d);
+          if (rig.routes.some(r => r.id === id)) throw new HttpError(400, "route_exists", `索号「${id}」已存在`);
+          // 索路即使存在校验问题（跨桅、未登记连接、未回目标桅区等）也允许登记，问题由报告标出
+          rig.routes.push({ id, name, start: input.start, end: input.end, via, targetZone });
+          return ship;
+        });
+        return send(res, 201, shipView(saved));
       }
 
       const routeId = shipMatch[3] && resource === "routes" ? decodeURIComponent(shipMatch[3]) : null;
       if (routeId && req.method === "PATCH") {
-        const route = rig.routes.find(r => r.id === routeId);
-        if (!route) return send(res, 404, { error: "route_not_found" });
         const input = await body(req);
-        Object.assign(route, {
-          name: input.name ?? route.name,
-          start: input.start ?? route.start,
-          end: input.end ?? route.end,
-          via: Array.isArray(input.via) ? input.via : route.via,
-          targetZone: input.targetZone ?? route.targetZone
+        const saved = await withWrite(d => {
+          const { rig, ship } = locate(d);
+          const route = rig.routes.find(r => r.id === routeId);
+          if (!route) throw new HttpError(404, "route_not_found");
+          const targetZone = input.targetZone !== undefined ? String(input.targetZone || "").trim() : route.targetZone;
+          if (!targetZone) throw new HttpError(400, "target_zone_required", "目标桅区必填，且终点必须回到该区");
+          Object.assign(route, {
+            name: input.name ?? route.name,
+            start: input.start ?? route.start,
+            end: input.end ?? route.end,
+            via: Array.isArray(input.via) ? input.via : route.via,
+            targetZone
+          });
+          return ship;
         });
-        await saveDb(db);
-        return send(res, 200, shipView(ship));
+        return send(res, 200, shipView(saved));
       }
       if (routeId && req.method === "DELETE") {
-        const idx = rig.routes.findIndex(r => r.id === routeId);
-        if (idx < 0) return send(res, 404, { error: "route_not_found" });
-        rig.routes.splice(idx, 1);
-        await saveDb(db);
-        return send(res, 200, shipView(ship));
+        const saved = await withWrite(d => {
+          const { rig, ship } = locate(d);
+          const idx = rig.routes.findIndex(r => r.id === routeId);
+          if (idx < 0) throw new HttpError(404, "route_not_found");
+          rig.routes.splice(idx, 1);
+          return ship;
+        });
+        return send(res, 200, shipView(saved));
       }
     }
 
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, error.statusCode || 500, { error: error.message });
+    const status = error.statusCode || 500;
+    send(res, status, { error: error.code || error.message, detail: error.detail || error.message });
   }
 });
 server.listen(port, () => console.log("古船模型帆索校准 listening on http://localhost:" + port));

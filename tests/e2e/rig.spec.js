@@ -68,13 +68,15 @@ test("正确索路：页面登记节点/连接/索路后显示可装配", async 
     await expect(page.locator("#nodeError")).toBeEmpty();
   }
 
-  // 页面登记两条允许连接关系
+  // 页面登记两条允许连接关系（每次等待保存完成、下拉重新填充后再登记下一条）
   for (const [from, to] of [["M1", "B1"], ["B1", "T1"]]) {
     await page.selectOption("#linkFrom", from);
     await page.selectOption("#linkTo", to);
+    const p = page.waitForResponse(r => r.url().includes("/links") && r.request().method() === "POST");
     await page.click("#linkForm button[type=submit]");
+    expect((await p).status()).toBe(201);
   }
-  await expect(page.locator("#linkList")).toContainText("M1→B1");
+  await expect(page.locator("#linkList")).toContainText("B1→T1");
 
   // 页面提交有向索路
   const resp = await submitRouteUI(page, { id: "L1", name: "主桅升帆索", start: "M1", end: "T1", via: "B1", targetZone: "主桅" });
@@ -145,6 +147,17 @@ const ERROR_CASES = [
     ],
     links: [["M1", "B1"], ["B1", "T1"]],
     route: { id: "L1", name: "起终点倒置索", start: "T1", end: "M1", via: "B1", targetZone: "主桅" }
+  },
+  {
+    code: "E2E-UNLINKED", label: "连接未登记", issue: "unlinked",
+    nodes: [
+      { id: "M1", type: "桅杆", zone: "主桅" },
+      { id: "B1", type: "滑轮", zone: "主桅" },
+      { id: "T1", type: "系点", zone: "主桅" }
+    ],
+    // 只登记首段 M1→B1，缺后段 B1→T1
+    links: [["M1", "B1"]],
+    route: { id: "L1", name: "缺后段连接索", start: "M1", end: "T1", via: "B1", targetZone: "主桅" }
   },
   {
     code: "E2E-ZONE", label: "未回到目标桅区", issue: "wrong_zone",
@@ -338,5 +351,161 @@ test("重启后数据仍在", async ({ page }) => {
     await expect(page.locator("#routeTable")).toContainText("持久化索");
   } finally {
     child.kill("SIGTERM");
+  }
+});
+
+/* ================= 反例：目标桅区必填（400 不落盘，页面表单必填） ================= */
+test("目标桅区为空：API 拒收且不写盘，索路数量不变", async ({ request }) => {
+  const ctx = globalThis.__ctx;
+  const sid = await createShip(ctx, "E2E-ZONE-REQ");
+  await addNode(ctx, sid, { id: "M1", type: "桅杆", zone: "主桅" });
+  await addNode(ctx, sid, { id: "T1", type: "系点", zone: "主桅" });
+  await addLink(ctx, sid, "M1", "T1");
+
+  const before = await (await request.get(`/api/ships/${sid}`)).json();
+  const res = await request.post(`/api/ships/${sid}/routes`, {
+    data: { id: "LZ", name: "空桅区索", start: "M1", end: "T1", via: [], targetZone: "  " }
+  });
+  expect(res.status()).toBe(400);
+  const body = await res.json();
+  expect(body.error).toBe("target_zone_required");
+
+  const after = await (await request.get(`/api/ships/${sid}`)).json();
+  expect(after.report.totalRoutes).toBe(before.report.totalRoutes);
+  expect(after.report.totalRoutes).toBe(0);
+  // 落盘文件里也不能出现该索
+  expect(readFileSync(DB_PATH, "utf8")).not.toContain("空桅区索");
+
+  // PATCH 清空目标桅区同样被拒
+  await ctx.post(`/api/ships/${sid}/routes`, {
+    data: { id: "LZ2", name: "有桅区索", start: "M1", end: "T1", via: [], targetZone: "主桅" }
+  });
+  const patch = await request.patch(`/api/ships/${sid}/routes/LZ2`, { data: { targetZone: "" } });
+  expect(patch.status()).toBe(400);
+  const view = await (await request.get(`/api/ships/${sid}`)).json();
+  expect(view.rig.routes[0].targetZone).toBe("主桅");
+});
+
+test("目标桅区为空：真实浏览器中表单必填并提示终点须回该区", async ({ page }) => {
+  const ctx = globalThis.__ctx;
+  const sid = await createShip(ctx, "E2E-ZONE-UI");
+  await addNode(ctx, sid, { id: "M1", type: "桅杆", zone: "主桅" });
+  await addNode(ctx, sid, { id: "T1", type: "系点", zone: "主桅" });
+  await addLink(ctx, sid, "M1", "T1");
+
+  await openShip(page, "E2E-ZONE-UI");
+  await page.fill("#routeForm [name=rid]", "LUI");
+  await page.fill("#routeForm [name=name]", "界面必填索");
+  await page.selectOption("#routeStart", "M1");
+  await page.selectOption("#routeEnd", "T1");
+  // 目标桅区留空：HTML5 required 阻止提交，且无任何请求发出
+  const responsePromise = page.waitForResponse(r => r.url().includes("/routes"), { timeout: 1200 }).catch(() => null);
+  await page.click("#routeForm button[type=submit]");
+  expect(await responsePromise).toBeNull();
+  await expect(page.locator("#routeTable")).not.toContainText("界面必填索");
+  // 标签注明必填
+  await expect(page.locator("#routeForm label", { hasText: "目标桅区" })).toContainText("必填");
+});
+
+/* ================= 反例：每一段连接都必须登记（真实浏览器） ================= */
+test("索路任何一段连接未登记都阻断：无白名单与缺后段都不可装配", async ({ page, request }) => {
+  const ctx = globalThis.__ctx;
+  const sid = await createShip(ctx, "E2E-STRICT-LINK");
+  for (const n of [
+    { id: "M1", type: "桅杆", zone: "主桅" },
+    { id: "B1", type: "滑轮", zone: "主桅" },
+    { id: "T1", type: "系点", zone: "主桅" }
+  ]) await addNode(ctx, sid, n);
+  // 只登记首段
+  await addLink(ctx, sid, "M1", "B1");
+
+  await openShip(page, "E2E-STRICT-LINK");
+  await submitRouteUI(page, { id: "LMISS", name: "缺后段索", start: "M1", end: "T1", via: "B1", targetZone: "主桅" });
+
+  await expect(page.locator("#stateBlock")).toContainText("阻断");
+  const issue = page.locator('.issue[data-issue="unlinked"]').first();
+  await expect(issue).toBeVisible();
+  await expect(issue).toContainText("连接未登记");
+  await expect(issue).toContainText("B1 → T1");
+  await expect(issue).toContainText("缺后段索");
+
+  // 新增一条完全没有任何连接关系的船，提交索路后同样阻断
+  const sid2 = await createShip(ctx, "E2E-STRICT-LINK2");
+  await addNode(ctx, sid2, { id: "X1", type: "桅杆", zone: "主桅" });
+  await addNode(ctx, sid2, { id: "Y1", type: "系点", zone: "主桅" });
+  const r = await request.post(`/api/ships/${sid2}/routes`, {
+    data: { id: "R1", name: "无白名单裸索", start: "X1", end: "Y1", via: [], targetZone: "主桅" }
+  });
+  expect(r.ok()).toBeTruthy();
+  const rep = await (await request.get(`/api/ships/${sid2}/report`)).json();
+  expect(rep.report.ready).toBe(false);
+  expect(rep.report.blocking[0].issues.map(i => i.type)).toContain("unlinked");
+});
+
+/* ================= 反例：并发登记不丢记录、无 5xx、响应与落盘一致 ================= */
+test("并发登记 30 个节点：全部成功且全部落盘，无服务端错误", async ({ request }) => {
+  const sid = await createShip(globalThis.__ctx, "E2E-CONCURRENT");
+  const N = 30;
+  const results = await Promise.all(Array.from({ length: N }, (_, i) =>
+    request.post(`/api/ships/${sid}/nodes`, {
+      data: { id: `P${i.toString().padStart(2, "0")}`, type: "滑轮", zone: "主桅" }
+    })
+  ));
+  const statuses = results.map(r => r.status());
+  expect(statuses.filter(s => s >= 500)).toHaveLength(0);
+  expect(statuses.filter(s => s === 201)).toHaveLength(N);
+
+  const view = await (await request.get(`/api/ships/${sid}`)).json();
+  const ids = view.rig.nodes.map(n => n.id).sort();
+  expect(ids).toEqual(Array.from({ length: N }, (_, i) => `P${i.toString().padStart(2, "0")}`));
+
+  // 落盘文件与成功响应一致
+  const onDisk = JSON.parse(readFileSync(DB_PATH, "utf8"));
+  const ship = onDisk.items.find(x => x.id === sid);
+  expect(ship.rig.nodes).toHaveLength(N);
+});
+
+test("并发重复登记同一编号：恰有一个成功，落盘恰有一条", async ({ request }) => {
+  const sid = await createShip(globalThis.__ctx, "E2E-CONCURRENT-DUP");
+  const results = await Promise.all(Array.from({ length: 20 }, () =>
+    request.post(`/api/ships/${sid}/nodes`, { data: { id: "DUP", type: "系点", zone: "主桅" } })
+  ));
+  const statuses = results.map(r => r.status());
+  expect(statuses.filter(s => s === 201)).toHaveLength(1);
+  expect(statuses.filter(s => s === 400)).toHaveLength(19);
+  expect(statuses.filter(s => s >= 500)).toHaveLength(0);
+
+  const view = await (await request.get(`/api/ships/${sid}`)).json();
+  expect(view.rig.nodes).toHaveLength(1);
+  expect(view.rig.nodes[0].id).toBe("DUP");
+});
+
+test("并发混合写入（建船/节点/连接交错）不丢记录", async ({ request }) => {
+  // 对同一条船并发写入；节点先全部落盘后再并发登记依赖它们的连接
+  const sid = await createShip(globalThis.__ctx, "E2E-CONCURRENT-MIX");
+  const nodeWrites = [];
+  for (let i = 0; i < 10; i++) {
+    nodeWrites.push(request.post(`/api/ships/${sid}/nodes`, { data: { id: `A${i}`, type: "桅杆", zone: "主桅" } }));
+    nodeWrites.push(request.post(`/api/ships/${sid}/nodes`, { data: { id: `T${i}`, type: "系点", zone: "主桅" } }));
+  }
+  const nodeRes = await Promise.all(nodeWrites);
+  expect(nodeRes.filter(r => r.status() >= 500)).toHaveLength(0);
+  expect(nodeRes.filter(r => r.status() === 201)).toHaveLength(20);
+
+  // 节点已存在，连接与一条索路并发交错写入
+  const writes = [];
+  for (let i = 0; i < 10; i++) writes.push(request.post(`/api/ships/${sid}/links`, { data: { from: `A${i}`, to: `T${i}` } }));
+  writes.push(request.post(`/api/ships/${sid}/routes`, { data: { id: "R0", name: "并发索", start: "A0", end: "T0", via: [], targetZone: "主桅" } }));
+  const results = await Promise.all(writes);
+  expect(results.filter(r => r.status() >= 500)).toHaveLength(0);
+  expect(results.filter(r => r.status() === 201)).toHaveLength(11);
+
+  const view = await (await request.get(`/api/ships/${sid}`)).json();
+  expect(view.rig.nodes).toHaveLength(20);
+  expect(view.rig.links).toHaveLength(10);
+  expect(view.rig.routes).toHaveLength(1);
+  for (const l of view.rig.links) {
+    expect(view.rig.nodes.some(n => n.id === l.from)).toBeTruthy();
+    expect(view.rig.nodes.some(n => n.id === l.to)).toBeTruthy();
   }
 });
